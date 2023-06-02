@@ -1,0 +1,16 @@
+#!/bin/sh
+
+#echo 15 > /proc/sys/vm/zone_reclaim_mode
+#echo 2 > /proc/sys/kernel/numa_balancing
+#echo 1 > /sys/kernel/mm/numa/demotion_enabled
+#echo 200 > /proc/sys/vm/demote_scale_factor
+
+./env.sh
+
+./ycsb-0.17.0/bin/ycsb load memcached -s -P /root/ycsb-0.17.0/workloads/workloada -p "memcached.hosts=127.0.0.1"
+
+#sleep 10
+
+#./ycsb-0.17.0/bin/ycsb run memcached -s -P /root/ycsb-0.17.0/workloads/workloada -p "memcached.hosts=127.0.0.1" >result 2>&1
+
+

@@ -1,0 +1,118 @@
+#!/bin/bash
+
+# ref: Huaicheng Li
+
+KIMGFILE="bzImage"
+PMSZ=32
+
+DIRNAME="ycsb_tpp"
+#EXEFILE="ycsb.sh"
+
+LOADFILE="load_ycsbtpp"
+RUNFILE="run_ycsb"
+
+BWDONE="BWDONE_YCSB"
+CHECKPCM_EXE="checkpcm_ycsb.sh"
+
+CPUNUM=8
+PINSHELL="pin8.sh"
+
+# $1: vnode ID, 0 or 1
+# $2: host/backing node ID to allocate VM memory from
+# $3: mem size in GB
+# $4: vcpus for this vnode, e.g. "0-7" (optional -> computeless-vnode)
+
+function configure_vnode()
+{
+	vnodeid=$1
+	hnodeid=$2
+	memsz=$3
+	nodecpus=$4
+
+	cmd="-object memory-backend-ram,size=${memsz}G,policy=bind,host-nodes=${hnodeid},id=ram-node${vnodeid},prealloc=on,prealloc-threads=16 "
+
+	cmd=${cmd}"-numa node,nodeid=${vnodeid},"
+
+	if [[ $nodecpus != "" ]]; then
+		cmd=${cmd}"cpus=$nodecpus,"
+	fi
+
+	cmd=${cmd}"memdev=ram-node${vnodeid}"
+	echo $cmd
+}
+
+./envsetup.sh
+
+#for LOCALMEMSZ in 30 27; do
+for LOCALMEMSZ in 27; do
+		TOTALMEMSZ=$((${LOCALMEMSZ}+${PMSZ}))
+		if [ ${LOCALMEMSZ} -ne 0 ]; then
+			L1=$(configure_vnode 0 1 ${LOCALMEMSZ} 0-7)
+			L2=$(configure_vnode 1 3 ${PMSZ})
+		else
+			L1=$(configure_vnode 0 3 ${PMSZ} 0-7)
+			L2=""
+		fi
+
+		#for j in {1..10}; do
+		for j in {1..3}; do
+
+			mkdir -p logs/${DIRNAME}/${LOCALMEMSZ}/${j}
+
+			echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
+			sleep 10
+
+			sudo nohup sudo qemu-system-x86_64 -kernel ${KIMGFILE} -nographic  \
+			-device virtio-scsi-pci,id=scsi0 \
+			-device scsi-hd,drive=hd0 \
+			-drive format=raw,file=qemuimg,id=hd0,if=none,aio=native,cache=none -append "root=/dev/sda rw console=ttyS0" \
+			-cpu host -enable-kvm -smp ${CPUNUM} -machine type=pc,accel=kvm,mem-merge=off \
+			-net user,hostfwd=tcp::5556-:22 \
+			-net nic,model=virtio \
+			-device virtio-net,netdev=network0 \
+			-netdev tap,id=network0,ifname=tap0,script=no,downscript=no \
+			-qmp unix:./qmp-sock,server,nowait \
+			-serial mon:stdio ${L1} ${L2} -m ${TOTALMEMSZ}G > logs/${DIRNAME}/${LOCALMEMSZ}/${j}/log 2>&1 &
+
+			sleep 45
+			vmstatus=$(ssh -p5556 -o BatchMode=yes -o ConnectTimeout=5 root@localhost echo ok 2>&1)
+			while [[ $vmstatus != "ok" ]]; do
+				sleep 30
+				vmstatus=$(ssh -p5556 -o BatchMode=yes -o ConnectTimeout=5 root@localhost echo ok 2>&1)
+			done
+			echo "VM for ${DIRNAME} ${LOCALMEMSZ} ${j} is up!"
+			sudo ./${PINSHELL}
+
+			ssh -p5556 root@localhost "./${LOADFILE} && sleep 10 && exit"
+			echo "${DIRNAME}/${LOCALMEMSZ}  ${j} running..."
+			(ssh -p5556 root@localhost "./${RUNFILE} && mv result ${DIRNAME}/${LOCALMEMSZ}/${j}/result.$(date +%h%d%H%M) && mv pgstat ${DIRNAME}/${LOCALMEMSZ}/${j}/pgstat.$(date +%h%d%H%M) && mv pgstat0 ${DIRNAME}/${LOCALMEMSZ}/${j}/pgstat0.$(date +%h%d%H%M) && mv pgstat1 ${DIRNAME}/${LOCALMEMSZ}/${j}/pgstat1.$(date +%h%d%H%M) && exit" && touch ${BWDONE}) &
+			sleep 20
+			sudo ./pcm-memory -silent -nc -- ./${CHECKPCM_EXE} | grep "NODE 1 "| awk 'BEGIN {FS="NODE 1 "}; { print $2 }' > MBW 2>&1
+
+			# calculate PMM access ratio
+			pbw_read=($(cat MBW | grep -E 'PMM Read' | tr -d '[:space:]' | cut -d':' -f2 | cut -d'-' -f1))
+			pbw_write=($(cat MBW | grep -E 'PMM Write' | tr -d '[:space:]' | cut -d':' -f2 | cut -d'-' -f1))
+			mbw=($(cat MBW | grep -E 'Memory' | tr -d '[:space:]' | cut -d':' -f2 | cut -d'-' -f1))
+			paratio=($(echo "scale=3; (${pbw_read}+${pbw_write})*100/${mbw}" | bc -l))
+			echo "PMM Access Ratio: "${paratio}"%" >> MBW
+			sleep 2
+			mv MBW BW/${DIRNAME}/${LOCALMEMSZ}/${j}/MBW.$(date +%h%d%H%M)
+			rm ${BWDONE}
+
+			echo "Now shutdown the VM"
+			ssh -p5556 root@localhost "shutdown -h now"
+			echo "Waiting for VM ${LOCALMEMSZ} to shutdown"
+			sleep 90
+
+			flag=0
+			for pid in $(ps -ef | grep qemu-system-x86_64 | grep -v grep | awk '{print $2}'); do
+				sudo kill -9 $pid
+				flag=1
+			done
+			if [ ${flag} -eq 1 ]; then
+				sleep 60
+			fi
+		done
+
+done
+
